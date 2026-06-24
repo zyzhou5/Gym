@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import re
-from typing import Any
+from typing import Any, cast
 
 import httpx
 from harbor.llms.base import (
@@ -72,6 +72,8 @@ class NemoGymLLM(BaseLLM):
         self._last_prompt_token_ids: list[int] | None = None
         self._last_completion_token_ids: list[int] | None = None
         self._last_logprobs: list[float] | None = None
+        self._last_routed_experts: list[list[list[int]]] | None = None
+        self._routed_experts_history: list[list[list[list[int]]] | None] = []
 
         # Set when the model hits the context length limit.
         self.context_length_exceeded = False
@@ -113,6 +115,8 @@ class NemoGymLLM(BaseLLM):
                     msg["prompt_token_ids"] = self._last_prompt_token_ids
                     msg["generation_token_ids"] = self._last_completion_token_ids or []
                     msg["generation_log_probs"] = self._last_logprobs or []
+                    if self._last_routed_experts is not None:
+                        msg["routed_experts"] = self._last_routed_experts
                     break
 
         payload: dict[str, Any] = {
@@ -190,10 +194,13 @@ class NemoGymLLM(BaseLLM):
         if self._collect_rollout_details:
             prompt_token_ids, completion_token_ids = self._extract_token_ids(response_dict)
             logprobs = self._extract_logprobs(response_dict)
+            routed_experts = self._extract_routed_experts(response_dict)
             # Store for on-policy correction on the next turn.
             self._last_prompt_token_ids = prompt_token_ids
             self._last_completion_token_ids = completion_token_ids
             self._last_logprobs = logprobs
+            self._last_routed_experts = routed_experts
+            self._routed_experts_history.append(routed_experts)
 
         return LLMResponse(
             content=content,
@@ -264,6 +271,10 @@ class NemoGymLLM(BaseLLM):
             return f"{self._api_base}/chat/completions"
         return f"{self._api_base}/v1/chat/completions"
 
+    @property
+    def routed_experts_history(self) -> list[list[list[list[int]]] | None]:
+        return list(self._routed_experts_history)
+
     def _extract_token_ids(self, response: dict[str, Any]) -> tuple[list[int] | None, list[int] | None]:
         choices = response.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -327,6 +338,17 @@ class NemoGymLLM(BaseLLM):
                 return extracted
 
         return None
+
+    def _extract_routed_experts(self, response: dict[str, Any]) -> list[list[list[int]]] | None:
+        choices = response.get("choices", [])
+        choice = choices[0] if isinstance(choices, list) and choices else {}
+        message = choice.get("message", {}) if isinstance(choice, dict) else {}
+        routed_experts = message.get("routed_experts") if isinstance(message, dict) else None
+        if routed_experts is None:
+            routed_experts = response.get("routed_experts")
+        if not isinstance(routed_experts, list):
+            return None
+        return cast(list[list[list[int]]], routed_experts)
 
     def _extract_usage_info(self, response: dict[str, Any]) -> UsageInfo | None:
         usage = response.get("usage")

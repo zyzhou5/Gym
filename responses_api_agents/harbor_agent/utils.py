@@ -338,7 +338,10 @@ class HarborAgentUtils:
             prompt_token_ids = metrics.get("prompt_token_ids")
             completion_token_ids = metrics.get("completion_token_ids")
             logprobs = metrics.get("logprobs")
-            routed_experts = metrics.get("routed_experts")
+            metrics_extra = metrics.get("extra") or {}
+            if not isinstance(metrics_extra, dict):
+                metrics_extra = {}
+            routed_experts = metrics.get("routed_experts") or metrics_extra.get("routed_experts")
             has_token_details = prompt_token_ids or completion_token_ids or logprobs
 
             if has_token_details:

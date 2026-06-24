@@ -97,6 +97,7 @@ from nemo_gym.server_utils import (
 # Training-specific
 ########################################
 
+# Per-token routed expert indices with shape [tokens, num_moe_layers, topk].
 RoutedExperts: TypeAlias = List[List[List[int]]]
 
 
@@ -104,7 +105,7 @@ class TokenIDLogProbMixin(BaseModel):
     prompt_token_ids: List[int]
     generation_token_ids: List[int]
     generation_log_probs: List[float]
-    routed_experts: Optional[RoutedExperts] = Field(default=None, exclude_if=lambda value: value is None)
+    routed_experts: Optional[RoutedExperts] = None
 
 
 class TokenIDLogProbTypedDictMixin(TypedDict):

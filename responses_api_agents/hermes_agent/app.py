@@ -347,6 +347,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             pti = last_valid["prompt_token_ids"] if last_valid else [0]
             gti = last_valid["generation_token_ids"] if last_valid else [0]
             glp = (last_valid.get("generation_log_probs") if last_valid else None) or [0.0]
+            routed_experts = last_valid.get("routed_experts") if last_valid else None
             output_items.append(
                 NeMoGymResponseOutputMessageForTraining(
                     id=f"msg_{uuid4().hex}",
@@ -357,6 +358,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
                     prompt_token_ids=pti,
                     generation_token_ids=gti,
                     generation_log_probs=glp,
+                    routed_experts=routed_experts,
                 )
             )
 
