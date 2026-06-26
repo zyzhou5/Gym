@@ -34,6 +34,10 @@ from tenacity import (
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
 
 
+_RoutedExperts = list[list[list[int]]]
+_RolloutDetailsKey = tuple[tuple[int, ...], tuple[int, ...], tuple[float, ...] | None]
+
+
 # Phrases in vLLM / OpenAI error bodies that signal context-length overflow.
 _CONTEXT_LENGTH_ERROR_PHRASES = (
     "context length exceeded",
@@ -72,8 +76,9 @@ class NemoGymLLM(BaseLLM):
         self._last_prompt_token_ids: list[int] | None = None
         self._last_completion_token_ids: list[int] | None = None
         self._last_logprobs: list[float] | None = None
-        self._last_routed_experts: list[list[list[int]]] | None = None
-        self._routed_experts_history: list[list[list[list[int]]] | None] = []
+        self._last_routed_experts: _RoutedExperts | None = None
+        self._routed_experts_by_rollout_details: dict[_RolloutDetailsKey, _RoutedExperts] = {}
+        self._ambiguous_routed_expert_keys: set[_RolloutDetailsKey] = set()
 
         # Set when the model hits the context length limit.
         self.context_length_exceeded = False
@@ -200,7 +205,12 @@ class NemoGymLLM(BaseLLM):
             self._last_completion_token_ids = completion_token_ids
             self._last_logprobs = logprobs
             self._last_routed_experts = routed_experts
-            self._routed_experts_history.append(routed_experts)
+            self._store_routed_experts_for_rollout_details(
+                prompt_token_ids,
+                completion_token_ids,
+                logprobs,
+                routed_experts,
+            )
 
         return LLMResponse(
             content=content,
@@ -271,10 +281,6 @@ class NemoGymLLM(BaseLLM):
             return f"{self._api_base}/chat/completions"
         return f"{self._api_base}/v1/chat/completions"
 
-    @property
-    def routed_experts_history(self) -> list[list[list[list[int]]] | None]:
-        return list(self._routed_experts_history)
-
     def _extract_token_ids(self, response: dict[str, Any]) -> tuple[list[int] | None, list[int] | None]:
         choices = response.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
@@ -339,7 +345,7 @@ class NemoGymLLM(BaseLLM):
 
         return None
 
-    def _extract_routed_experts(self, response: dict[str, Any]) -> list[list[list[int]]] | None:
+    def _extract_routed_experts(self, response: dict[str, Any]) -> _RoutedExperts | None:
         choices = response.get("choices", [])
         choice = choices[0] if isinstance(choices, list) and choices else {}
         message = choice.get("message", {}) if isinstance(choice, dict) else {}
@@ -348,7 +354,52 @@ class NemoGymLLM(BaseLLM):
             routed_experts = response.get("routed_experts")
         if not isinstance(routed_experts, list):
             return None
-        return cast(list[list[list[int]]], routed_experts)
+        return cast(_RoutedExperts, routed_experts)
+
+    def _store_routed_experts_for_rollout_details(
+        self,
+        prompt_token_ids: list[int] | None,
+        completion_token_ids: list[int] | None,
+        logprobs: list[float] | None,
+        routed_experts: _RoutedExperts | None,
+    ) -> None:
+        if routed_experts is None:
+            return
+
+        key = self._rollout_details_key(prompt_token_ids, completion_token_ids, logprobs)
+        if key is None:
+            return
+
+        if key in self._routed_experts_by_rollout_details:
+            self._ambiguous_routed_expert_keys.add(key)
+            self._routed_experts_by_rollout_details.pop(key, None)
+            return
+
+        if key not in self._ambiguous_routed_expert_keys:
+            self._routed_experts_by_rollout_details[key] = routed_experts
+
+    def pop_routed_experts_for_rollout_details(
+        self,
+        prompt_token_ids: list[int] | None,
+        completion_token_ids: list[int] | None,
+        logprobs: list[float] | None,
+    ) -> _RoutedExperts | None:
+        key = self._rollout_details_key(prompt_token_ids, completion_token_ids, logprobs)
+        if key is None or key in self._ambiguous_routed_expert_keys:
+            return None
+        return self._routed_experts_by_rollout_details.pop(key, None)
+
+    @staticmethod
+    def _rollout_details_key(
+        prompt_token_ids: list[int] | None,
+        completion_token_ids: list[int] | None,
+        logprobs: list[float] | None,
+    ) -> _RolloutDetailsKey | None:
+        if prompt_token_ids is None or completion_token_ids is None:
+            return None
+
+        logprobs_key = tuple(logprobs) if logprobs is not None else None
+        return (tuple(prompt_token_ids), tuple(completion_token_ids), logprobs_key)
 
     def _extract_usage_info(self, response: dict[str, Any]) -> UsageInfo | None:
         usage = response.get("usage")

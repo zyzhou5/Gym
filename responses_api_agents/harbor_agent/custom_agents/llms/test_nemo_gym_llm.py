@@ -113,7 +113,20 @@ async def test_extracts_nemo_proxy_shape():
     assert response.prompt_token_ids == [11, 12]
     assert response.completion_token_ids == [13, 14]
     assert response.logprobs == [-0.3, -0.4]
-    assert llm.routed_experts_history == [routed_experts]
+    assert llm.pop_routed_experts_for_rollout_details([11, 12], [13, 14], [-0.3, -0.4]) == routed_experts
+    assert llm.pop_routed_experts_for_rollout_details([11, 12], [13, 14], [-0.3, -0.4]) is None
+
+
+def test_duplicate_rollout_details_keys_do_not_guess_routed_experts():
+    """Duplicate token/logprob keys are ambiguous, so they fail closed instead of guessing."""
+    llm = _make_llm(collect_rollout_details=True)
+    route_1 = [[[1]]]
+    route_2 = [[[2]]]
+
+    llm._store_routed_experts_for_rollout_details([1], [2], [-0.1], route_1)
+    llm._store_routed_experts_for_rollout_details([1], [2], [-0.1], route_2)
+
+    assert llm.pop_routed_experts_for_rollout_details([1], [2], [-0.1]) is None
 
 
 @pytest.mark.asyncio

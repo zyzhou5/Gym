@@ -127,17 +127,20 @@ class Terminus2NemoGym(Terminus2):
         if not isinstance(llm, NemoGymLLM):
             return
 
-        routed_experts_history = iter(llm.routed_experts_history)
         modified = False
         for step in getattr(self, "_trajectory_steps", []):
             if getattr(step, "source", None) != "agent":
                 continue
             metrics = getattr(step, "metrics", None)
-            try:
-                routed_experts = next(routed_experts_history)
-            except StopIteration:
-                break
-            if metrics is None or routed_experts is None:
+            if metrics is None:
+                continue
+
+            routed_experts = llm.pop_routed_experts_for_rollout_details(
+                getattr(metrics, "prompt_token_ids", None),
+                getattr(metrics, "completion_token_ids", None),
+                getattr(metrics, "logprobs", None),
+            )
+            if routed_experts is None:
                 continue
             metrics_extra = metrics.extra or {}
             metrics_extra["routed_experts"] = routed_experts

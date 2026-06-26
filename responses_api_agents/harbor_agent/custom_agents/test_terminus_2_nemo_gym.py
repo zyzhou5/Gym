@@ -19,27 +19,48 @@ from responses_api_agents.harbor_agent.custom_agents.llms.nemo_gym_llm import Ne
 from responses_api_agents.harbor_agent.custom_agents.terminus_2_nemo_gym import Terminus2NemoGym
 
 
-def test_attach_routed_experts_advances_history_for_agent_steps_without_metrics():
+def test_attach_routed_experts_matches_by_rollout_details_not_call_order():
     llm = NemoGymLLM(model_name="test-model", api_base="http://localhost:8000/v1")
-    route_1 = [[[1]]]
-    route_2 = [[[2]]]
-    route_3 = [[[3]]]
-    llm._routed_experts_history = [route_1, route_2, route_3]
+    unmatched_route = [[[1]]]
+    matched_route = [[[2]]]
+    llm._store_routed_experts_for_rollout_details([1], [10], [-0.1], unmatched_route)
+    llm._store_routed_experts_for_rollout_details([2], [20], [-0.2], matched_route)
 
-    first_metrics = SimpleNamespace(extra=None)
-    third_metrics = SimpleNamespace(extra={})
+    metrics = SimpleNamespace(
+        prompt_token_ids=[2],
+        completion_token_ids=[20],
+        logprobs=[-0.2],
+        extra=None,
+    )
 
     agent = Terminus2NemoGym.__new__(Terminus2NemoGym)
     agent._llm = llm
     agent._trajectory_steps = [
-        SimpleNamespace(source="agent", metrics=first_metrics),
-        SimpleNamespace(source="agent", metrics=None),
-        SimpleNamespace(source="agent", metrics=third_metrics),
+        SimpleNamespace(source="agent", metrics=metrics),
     ]
     agent._dump_trajectory = MagicMock()
 
     Terminus2NemoGym._attach_routed_experts_to_trajectory(agent)
 
-    assert first_metrics.extra == {"routed_experts": route_1}
-    assert third_metrics.extra == {"routed_experts": route_3}
+    assert metrics.extra == {"routed_experts": matched_route}
     agent._dump_trajectory.assert_called_once()
+
+
+def test_attach_routed_experts_skips_steps_without_rollout_details():
+    llm = NemoGymLLM(model_name="test-model", api_base="http://localhost:8000/v1")
+    llm._store_routed_experts_for_rollout_details([1], [10], [-0.1], [[[1]]])
+
+    metrics = SimpleNamespace(extra={})
+
+    agent = Terminus2NemoGym.__new__(Terminus2NemoGym)
+    agent._llm = llm
+    agent._trajectory_steps = [
+        SimpleNamespace(source="agent", metrics=None),
+        SimpleNamespace(source="agent", metrics=metrics),
+    ]
+    agent._dump_trajectory = MagicMock()
+
+    Terminus2NemoGym._attach_routed_experts_to_trajectory(agent)
+
+    assert metrics.extra == {}
+    agent._dump_trajectory.assert_not_called()
