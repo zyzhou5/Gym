@@ -15,9 +15,9 @@
 
 """Interfaces for storing token data outside Gym model servers.
 
-Inference workers call these interfaces from synchronous capture hooks.
-Implementations must therefore provide synchronous methods.
-A serving system with async storage must move the call off its event loop.
+Synchronous capture hooks use ``StagingSink``. Async serving hosts may install
+an ``AsyncStagingSink`` and await the async capture completion methods instead.
+Both paths acknowledge a call only after the combined write has completed.
 
 The capture object may call ``StagingSink.stage`` concurrently.
 Implementations must synchronize their own shared state.
@@ -50,6 +50,20 @@ class StagingSink(Protocol):
     """
 
     def stage(self, record: StagedCallRecord, *, attachments: Mapping[str, Any] | None = None) -> StageResult: ...
+
+
+@runtime_checkable
+class AsyncStagingSink(Protocol):
+    """Await durable staging with the same attachment contract as ``StagingSink``.
+
+    Implementations may serve concurrent calls. If cancellation arrives after
+    submitting a write, settle that write and reclaim its row before propagating
+    cancellation, so no unacknowledged operation can publish later.
+    """
+
+    async def async_stage(
+        self, record: StagedCallRecord, *, attachments: Mapping[str, Any] | None = None
+    ) -> StageResult: ...
 
 
 @runtime_checkable
@@ -113,6 +127,7 @@ def install_capture(
     sink: StagingSink,
     weight_version_fn: WeightVersionProvider,
     adapter: CaptureAdapter | None = None,
+    async_sink: AsyncStagingSink | None = None,
 ) -> Any:
     """Install worker-owned staging without importing serving dependencies."""
     # Deferred to avoid the protocol/capture implementation import cycle.
@@ -123,4 +138,5 @@ def install_capture(
         sink=sink,
         weight_version_fn=weight_version_fn,
         adapter=adapter,
+        async_sink=async_sink,
     )

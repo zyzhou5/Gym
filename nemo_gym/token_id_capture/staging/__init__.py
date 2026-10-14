@@ -41,6 +41,7 @@ from nemo_gym.token_id_capture.staging.digest import (
     hash_token_ids,
 )
 from nemo_gym.token_id_capture.staging.protocols import (
+    AsyncStagingSink,
     CaptureAdapter,
     StagingSink,
     StagingSource,
@@ -93,6 +94,7 @@ from nemo_gym.token_id_capture.terminal import (
 
 
 __all__ = [
+    "AsyncStagingSink",
     "EMPTY_EXTRAS_DIGEST",
     "EXTRAS_DIGEST_VERSION",
     "MISSING_ROUTE_SENTINEL",

@@ -21,6 +21,7 @@ from nemo_gym.token_id_capture.staging.digest import (
     hash_token_ids,
 )
 from nemo_gym.token_id_capture.staging.protocols import (
+    AsyncStagingSink,
     CaptureAdapter,
     StagingSink,
     WeightVersionProvider,
@@ -76,8 +77,10 @@ class RolloutTokenCapture:
         sink: StagingSink,
         weight_version_fn: WeightVersionProvider,
         adapter: CaptureAdapter | None = None,
+        async_sink: AsyncStagingSink | None = None,
     ) -> None:
         self._sink = sink
+        self._async_sink = async_sink
         self._weight_version_fn = weight_version_fn
         self._adapter = adapter
         # Guards only the per-call single-completion transition. Sink writes
@@ -161,11 +164,82 @@ class RolloutTokenCapture:
         extras: dict[str, Any] | None = None,
         attachments: Mapping[str, Any] | None = None,
     ) -> CommitCoords:
-        """Stage a normalized delta before returning lightweight coordinates.
+        """Stage tokens and attachments before returning acknowledged coordinates."""
+        record = self._prepare_record(
+            call,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            generated_logprobs=generated_logprobs,
+            extras=extras,
+        )
+        if record is None:
+            return self._failed_coords(call)
+        try:
+            # The completion claim is per call; independent writes may overlap.
+            # Omit the keyword for legacy text-only sinks.
+            if attachments is None:
+                result = self._sink.stage(record)
+            else:
+                result = self._sink.stage(record, attachments=attachments)
+            return self._stage_coords(call, record, result)
+        except Exception:
+            # Sink exceptions poison capture, while cancellation propagates.
+            LOGGER.exception(
+                "token staging failed for rollout %s call %s",
+                call.rollout_id,
+                call.model_call_id,
+            )
+            return self._failed_coords(call)
 
-        ``attachments`` are opaque framework payloads staged in the same sink
-        write as the record; they are forwarded untouched and never digested.
-        """
+    async def async_complete_call(
+        self,
+        call: ActiveCall,
+        *,
+        prompt_token_ids: list[int],
+        generated_token_ids: list[int],
+        generated_logprobs: list[float],
+        extras: dict[str, Any] | None = None,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> CommitCoords:
+        """Stage tokens and attachments before returning acknowledged coordinates."""
+        if self._async_sink is None:
+            raise CaptureError("async_complete_call requires an AsyncStagingSink")
+        record = self._prepare_record(
+            call,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            generated_logprobs=generated_logprobs,
+            extras=extras,
+        )
+        if record is None:
+            return self._failed_coords(call)
+        try:
+            # The completion claim is per call; independent writes may overlap.
+            # Omit the keyword for legacy text-only sinks.
+            if attachments is None:
+                result = await self._async_sink.async_stage(record)
+            else:
+                result = await self._async_sink.async_stage(record, attachments=attachments)
+            return self._stage_coords(call, record, result)
+        except Exception:
+            # Sink exceptions poison capture, while cancellation propagates.
+            LOGGER.exception(
+                "token staging failed for rollout %s call %s",
+                call.rollout_id,
+                call.model_call_id,
+            )
+            return self._failed_coords(call)
+
+    def _prepare_record(
+        self,
+        call: ActiveCall,
+        *,
+        prompt_token_ids: list[int],
+        generated_token_ids: list[int],
+        generated_logprobs: list[float],
+        extras: dict[str, Any] | None,
+    ) -> StagedCallRecord | None:
+        """Claim completion once and construct the shared, digest-covered record."""
         self._claim_completion(call)
         admission = call.admission
         try:
@@ -227,33 +301,14 @@ class RolloutTokenCapture:
                 admission.rollout_id,
                 admission.model_call_id,
             )
-            return self._failed_coords(call)
-        try:
-            # Unlocked: the completion claim above already made this call the
-            # sole stager, and cross-call ordering comes from stage-before-ack
-            # (a child is only admitted after its parent's coords returned).
-            # Serializing here would head-of-line block every concurrent
-            # completion on the worker behind one sink round trip.
-            # Legacy text-only sinks accept only ``stage(record)``; the keyword
-            # is passed exactly when the caller supplied attachments so such a
-            # sink fails loudly (TypeError -> capture_failed) instead of having
-            # its attachments silently dropped by a retry without them.
-            if attachments is None:
-                result = self._sink.stage(record)
-            else:
-                result = self._sink.stage(record, attachments=attachments)
-            if not isinstance(result, StageResult):
-                raise TypeError(f"StagingSink.stage returned {type(result).__name__}, expected StageResult")
-        except Exception:
-            # The sink is framework code outside Gym's exception hierarchy.
-            # This deliberately broad boundary keeps capture failure from
-            # failing the model completion.
-            LOGGER.exception(
-                "token staging failed for rollout %s call %s",
-                admission.rollout_id,
-                admission.model_call_id,
-            )
-            return self._failed_coords(call)
+            return None
+        return record
+
+    def _stage_coords(self, call: ActiveCall, record: StagedCallRecord, result: StageResult) -> CommitCoords:
+        """Publish coordinates only after a valid successful sink acknowledgment."""
+        admission = call.admission
+        if not isinstance(result, StageResult):
+            raise TypeError(f"staging sink returned {type(result).__name__}, expected StageResult")
         if not result.ok:
             LOGGER.warning(
                 "token staging sink rejected rollout %s call %s: %s",
@@ -267,25 +322,21 @@ class RolloutTokenCapture:
             model_call_id=admission.model_call_id,
             parent_call_id=admission.parent_call_id,
             prev_len=admission.prev_len,
-            delta_len=delta_len,
-            cum_len=cum_len,
+            delta_len=record.delta_len,
+            cum_len=record.cum_len,
             weight_version=call.weight_version,
             disposition="staged",
-            digest=digest,
-            extras_digest=extras_digest,
+            digest=record.digest,
+            extras_digest=record.extras_digest,
             staging_key=result.staging_key,
-            chain_hash=chain_hash,
-            cumulative_hash=cumulative_hash,
+            chain_hash=record.chain_hash,
+            cumulative_hash=record.cumulative_hash,
         )
 
-    def complete_call_from_response(
-        self,
-        call: ActiveCall,
-        response_payload: Any,
-        *,
-        attachments: Mapping[str, Any] | None = None,
-    ) -> CommitCoords:
-        """Extract engine-native material and stage it as one atomic lifecycle step."""
+    def _extract_response_material(
+        self, call: ActiveCall, response_payload: Any
+    ) -> tuple[list[int], list[int], list[float], dict[str, Any] | None] | None:
+        """Extract engine material; extraction failure claims and poisons the call."""
         if self._adapter is None:
             raise CaptureError("complete_call_from_response requires a CaptureAdapter")
         try:
@@ -301,8 +352,43 @@ class RolloutTokenCapture:
                 call.model_call_id,
             )
             self._claim_completion(call)
+            return None
+        return prompt_token_ids, generated_token_ids, generated_logprobs, extras
+
+    def complete_call_from_response(
+        self,
+        call: ActiveCall,
+        response_payload: Any,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> CommitCoords:
+        """Extract engine-native material and stage it before acknowledgment."""
+        material = self._extract_response_material(call, response_payload)
+        if material is None:
             return self._failed_coords(call)
+        prompt_token_ids, generated_token_ids, generated_logprobs, extras = material
         return self.complete_call(
+            call,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            generated_logprobs=generated_logprobs,
+            extras=extras,
+            attachments=attachments,
+        )
+
+    async def async_complete_call_from_response(
+        self,
+        call: ActiveCall,
+        response_payload: Any,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> CommitCoords:
+        """Extract engine-native material and stage it before acknowledgment."""
+        material = self._extract_response_material(call, response_payload)
+        if material is None:
+            return self._failed_coords(call)
+        prompt_token_ids, generated_token_ids, generated_logprobs, extras = material
+        return await self.async_complete_call(
             call,
             prompt_token_ids=prompt_token_ids,
             generated_token_ids=generated_token_ids,
@@ -359,10 +445,13 @@ def install_capture(
     sink: StagingSink,
     weight_version_fn: WeightVersionProvider,
     adapter: CaptureAdapter | None = None,
+    async_sink: AsyncStagingSink | None = None,
 ) -> RolloutTokenCapture:
     """Wire worker-owned staging into one inference serving layer."""
     if not isinstance(sink, StagingSink):
         raise TypeError(f"sink does not implement StagingSink: {type(sink)!r}")
+    if async_sink is not None and not isinstance(async_sink, AsyncStagingSink):
+        raise TypeError(f"async_sink does not implement AsyncStagingSink: {type(async_sink)!r}")
     if not callable(weight_version_fn):
         raise TypeError(f"weight_version_fn must be callable, got {type(weight_version_fn)!r}")
     install = getattr(serving_layer, "install_token_capture", None)
@@ -372,6 +461,7 @@ def install_capture(
         sink=sink,
         weight_version_fn=weight_version_fn,
         adapter=adapter,
+        async_sink=async_sink,
     )
     install(capture)
     return capture
