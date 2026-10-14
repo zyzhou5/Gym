@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from collections.abc import Mapping
@@ -204,13 +205,25 @@ class RolloutTokenCapture:
         """Stage tokens and attachments before returning acknowledged coordinates."""
         if self._async_sink is None:
             raise CaptureError("async_complete_call requires an AsyncStagingSink")
-        record = self._prepare_record(
+        record = await asyncio.to_thread(
+            self._prepare_record,
             call,
             prompt_token_ids=prompt_token_ids,
             generated_token_ids=generated_token_ids,
             generated_logprobs=generated_logprobs,
             extras=extras,
         )
+        return await self._async_stage_record(call, record, attachments=attachments)
+
+    async def _async_stage_record(
+        self,
+        call: ActiveCall,
+        record: StagedCallRecord | None,
+        *,
+        attachments: Mapping[str, Any] | None,
+    ) -> CommitCoords:
+        """Await the sink before publishing coordinates for a prepared record."""
+        assert self._async_sink is not None
         if record is None:
             return self._failed_coords(call)
         try:
@@ -384,17 +397,23 @@ class RolloutTokenCapture:
         attachments: Mapping[str, Any] | None = None,
     ) -> CommitCoords:
         """Extract engine-native material and stage it before acknowledgment."""
+        if self._async_sink is None:
+            raise CaptureError("async_complete_call_from_response requires an AsyncStagingSink")
+        record = await asyncio.to_thread(self._prepare_response_record, call, response_payload)
+        return await self._async_stage_record(call, record, attachments=attachments)
+
+    def _prepare_response_record(self, call: ActiveCall, response_payload: Any) -> StagedCallRecord | None:
+        """Extract and digest response material in the serving host's worker pool."""
         material = self._extract_response_material(call, response_payload)
         if material is None:
-            return self._failed_coords(call)
+            return None
         prompt_token_ids, generated_token_ids, generated_logprobs, extras = material
-        return await self.async_complete_call(
+        return self._prepare_record(
             call,
             prompt_token_ids=prompt_token_ids,
             generated_token_ids=generated_token_ids,
             generated_logprobs=generated_logprobs,
             extras=extras,
-            attachments=attachments,
         )
 
     def fail_call(self, call: ActiveCall, *, reason: str) -> CommitCoords:

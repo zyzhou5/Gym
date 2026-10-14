@@ -4,6 +4,7 @@
 """Async capture preserves the synchronous integrity and acknowledgment contract."""
 
 import asyncio
+import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -146,3 +147,66 @@ def test_async_completion_requires_explicit_async_sink() -> None:
             capture.async_complete_call(call, prompt_token_ids=[1], generated_token_ids=[2], generated_logprobs=[-0.1])
         )
     assert not call.completed
+
+
+def test_extraction_and_digest_preparation_run_off_the_event_loop() -> None:
+    async def scenario() -> None:
+        sink = _Sink()
+        sink.release.set()
+        capture = _capture(sink)
+        loop_thread = threading.get_ident()
+        threads = []
+        extract = capture._extract_response_material
+        prepare = capture._prepare_record
+
+        def checked_extract(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return extract(*args, **kwargs)
+
+        def checked_prepare(*args, **kwargs):
+            threads.append(threading.get_ident())
+            return prepare(*args, **kwargs)
+
+        capture._extract_response_material = checked_extract
+        capture._prepare_record = checked_prepare
+        result = await capture.async_complete_call_from_response(capture.begin_call(_admission()), _response())
+        assert result.disposition == "staged"
+        assert len(threads) == 2
+        assert all(thread != loop_thread for thread in threads)
+
+    asyncio.run(scenario())
+
+
+def test_cancelling_record_preparation_never_calls_the_sink() -> None:
+    async def scenario() -> None:
+        sink = _Sink()
+        capture = _capture(sink)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original = capture._prepare_record
+
+        def prepare(*args, **kwargs):
+            started.set()
+            try:
+                assert release.wait(5)
+                return original(*args, **kwargs)
+            finally:
+                finished.set()
+
+        capture._prepare_record = prepare
+        task = asyncio.create_task(
+            capture.async_complete_call_from_response(capture.begin_call(_admission()), _response())
+        )
+        try:
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            release.set()
+            assert await asyncio.to_thread(finished.wait, 5)
+        assert sink.entered.empty()
+        assert sink.records == []
+
+    asyncio.run(scenario())
