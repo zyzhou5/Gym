@@ -684,7 +684,8 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
                         result = await sandbox.exec(f"mkdir -p -- {quote(workdir)}", cwd="/", timeout_s=30)
                         self._check_sandbox_setup(result)
                     result = await sandbox.exec(
-                        _BASH_BOOTSTRAP + f"test -d {quote(workdir)} && umask 077 && mkdir -p {quote(directory)}/config",
+                        _BASH_BOOTSTRAP
+                        + f"test -d {quote(workdir)} && umask 077 && mkdir -p {quote(directory)}/config",
                         cwd="/",
                         timeout_s=self.config.sandbox_install_timeout_seconds,
                     )

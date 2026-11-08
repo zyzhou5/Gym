@@ -339,7 +339,9 @@ async def test_native_events_outcome_and_shared_command_options(monkeypatch, tim
     assert response.output[0].content[0].text == "partial"
     assert response.status == status
     assert response.usage.total_tokens == 12
-    assert response.metadata is None  # no adapter-specific runtime policy fields
+    # Only process-completion evidence, which training masks read; no adapter-specific runtime policy fields.
+    finished = "true" if not timed_out and code == 0 else "false"
+    assert response.metadata == {"agent_execution_finished": finished}
     assert "model_call_ownership_unavailable" in [gap.code for gap in state.observations.gaps]
 
 

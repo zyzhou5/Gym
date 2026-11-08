@@ -2880,4 +2880,3 @@ def test_process_exit_before_promised_retry_is_execution_failure(setup):
         closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
         assert closed.status_code == 200
         assert closed.json()["agent_observations"]["records"][0]["status"] == "failed"
-

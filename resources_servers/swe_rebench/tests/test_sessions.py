@@ -58,13 +58,18 @@ def _server(monkeypatch: MonkeyPatch) -> tuple[SWERebenchResourcesServer, list[M
         stdout = "0123abcd\n" if "rev-parse HEAD" in command else ""
         return SandboxExecResult(return_code=0, stdout=stdout, stderr="")
 
-    async def create_sandbox(self, body, files=None) -> MagicMock:
+    async def create_sandbox(self, body, files=None, *, session_id=None, verifier_session_id=None) -> MagicMock:
         sandbox = MagicMock()
         sandbox._handle = SandboxHandle(sandbox_id=f"sb-{len(sandboxes) + 1}", provider_name="test", raw=None)
         sandbox.exec = AsyncMock(side_effect=exec_command)
         sandbox.serialize = AsyncMock(return_value={"sandbox_id": sandbox._handle.sandbox_id})
         sandbox.stop = AsyncMock()
         sandboxes.append(sandbox)
+        # Register ownership as the server's _create_sandbox does, so the shared session lifecycle sees it.
+        if session_id is not None:
+            self._session_id_to_sandbox[session_id] = sandbox
+        if verifier_session_id is not None:
+            self._verifier_sandboxes[verifier_session_id] = sandbox
         return sandbox
 
     monkeypatch.setattr(SWERebenchResourcesServer, "_create_sandbox", create_sandbox)

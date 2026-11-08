@@ -20,7 +20,8 @@ HARNESSES = ("opencode", "claude_code", "pi", "hermes", "nooa")
 ROOT = Path(__file__).resolve().parents[3]
 
 
-@pytest.mark.parametrize("harness", HARNESSES)
+# NOOA has no SWE environment config on this integration branch (its training controls are not integrated).
+@pytest.mark.parametrize("harness", [harness for harness in HARNESSES if harness != "nooa"])
 def test_all_swe_sources_admit_materialized_rows_without_changing_task_content(harness: str) -> None:
     config = GlobalConfigDictParser().parse(
         GlobalConfigDictParserConfig(
