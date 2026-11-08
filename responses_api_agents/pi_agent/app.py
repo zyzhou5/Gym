@@ -1222,6 +1222,7 @@ class PiAgent(SimpleResponsesAPIAgent):
                 "harness_execution": "sandbox",
                 **({"harness_hostname": runtime.hostname, "harness_pid": str(runtime.pid)} if runtime else {}),
                 "pi_version": self.config.pi_version,
+                "agent_execution_finished": str(state.session.execution_finished).lower(),
                 AGENT_TIMEOUT_METADATA_KEY: str(timeout),
                 # Stirrup's timeout report: the deadline stopped a run that had neither ended nor submitted.
                 **({"stop_reason": "wall_time"} if cleanup["timed_out"] and _was_still_working(events) else {}),

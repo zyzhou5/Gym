@@ -16,6 +16,7 @@ import orjson
 import pytest
 from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError
 from fastapi import Response
+from omegaconf import OmegaConf
 from pydantic import BaseModel, Field, ValidationError
 
 from environment_servers.single_agent_turn.app import (
@@ -33,7 +34,13 @@ from nemo_gym.agents import (
     AgentSeedSessionRequest,
 )
 from nemo_gym.client import ServerClient
-from nemo_gym.config import AggregateMetrics, AggregateMetricsRequest, ResourcesServerRef
+from nemo_gym.config import (
+    AggregateMetrics,
+    AggregateMetricsRequest,
+    GlobalConfigDictParser,
+    GlobalConfigDictParserConfig,
+    ResourcesServerRef,
+)
 from nemo_gym.core import (
     MODEL_TRANSPORT_ERROR,
     EpisodeId,
@@ -44,6 +51,8 @@ from nemo_gym.core import (
     TaskId,
     encode_model_sampling,
 )
+from nemo_gym.models.token_capture import TERMINAL_RESPONSE_ID_KEY
+from nemo_gym.rollouts import NG_ENVIRONMENT_SERVER_KEY, RolloutCollectionHelper
 from nemo_gym.server_runtime import (
     BaseVerifyRequest,
     ResourcesCloseSessionRequest,
@@ -55,6 +64,35 @@ from nemo_gym.server_runtime import (
 )
 from nemo_gym.trajectory import AgentObservationBundle, TrajectoryRecord
 from tests.helpers.single_agent_turn import _agent_response, _Client, _environment_server, _request, _Response
+
+
+@pytest.mark.parametrize("taskset", ["scale_swe", "swe_rebench", "swemer_v1"])
+def test_swe_training_config_admits_shared_opencode(taskset: str) -> None:
+    config = GlobalConfigDictParser().parse(
+        GlobalConfigDictParserConfig(
+            initial_global_config_dict=OmegaConf.merge(
+                GlobalConfigDictParserConfig.NO_MODEL_GLOBAL_CONFIG_DICT,
+                {
+                    "config_paths": [str(Path(__file__).parents[1] / "configs/swe_opencode.yaml")],
+                    "sandbox": {"docker": {}},
+                },
+            ),
+            default_config_paths=[],
+            skip_load_from_cli=True,
+            skip_load_from_dotenv=True,
+            offline=True,
+        )
+    )
+    RolloutCollectionHelper._validate_environment_servers(
+        [
+            {
+                NG_ENVIRONMENT_SERVER_KEY: config.environment_server_routes[taskset],
+                "task_id": {"taskset": taskset, "task_id": "test-task"},
+                "task_input": {},
+            }
+        ],
+        config,
+    )
 
 
 def test_module_exports_app_for_multi_worker_import(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -127,6 +165,123 @@ async def test_single_agent_turn_with_direct_resources_tools() -> None:
     assert client.calls[4][2]["cookies"] == {"session": "updated-cookie"}
     assert client.calls[5][2]["cookies"] == {"session": "updated-cookie"}
     assert resources_close_body.episode_id == EpisodeId(rollout_id="rollout", attempt=2)
+
+
+@pytest.mark.parametrize("finished", ["true", "false"])
+async def test_process_completion_survives_verifier_omitting_response_metadata(finished: str) -> None:
+    environment, client = _environment_server(token_capture=True)
+    agent_response = _agent_response().model_copy(
+        update={"status": "incomplete", "metadata": {"agent_execution_finished": finished}}
+    )
+    client.responses[2] = _Response(agent_response.model_dump(mode="json"))
+
+    reply = await environment.run_request(_request())
+
+    assert reply.failure is None
+    # Model output limits and process timeouts both produce incomplete responses;
+    # only explicit process evidence decides the harness-unfinished training mask.
+    assert reply.result.agent_execution_finished is (finished == "true")
+    assert reply.result.reward == 1.0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("finished,evaluated", [("true", True), ("false", True), ("true", False)])
+async def test_training_mask_is_opt_in_and_keeps_verifier_quality_and_rewards(enabled, finished, evaluated):
+    environment, client = _environment_server(token_capture=True)
+    environment.config.mask_incomplete_for_training = enabled
+    client.responses[2] = _Response(
+        _agent_response()
+        .model_copy(update={"metadata": {"agent_execution_finished": finished}})
+        .model_dump(mode="json")
+    )
+    verification = orjson.loads(client.responses[4].body)
+    verification.update(evaluation_completed=evaluated, instance_config={"custom": "preserved"}, mask_sample=False)
+    client.responses[4] = _Response(verification)
+
+    reply = await environment.run_request(_request())
+
+    fields = reply.result.model_dump(mode="json")
+    assert fields["instance_config"]["custom"] == "preserved"
+    assert fields["instance_config"].get("mask_sample", False) is (enabled and (finished == "false" or not evaluated))
+    assert fields["mask_sample"] is False
+    assert fields["reward"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "verifier_fields",
+    [
+        {},
+        {TERMINAL_RESPONSE_ID_KEY: None},
+        {TERMINAL_RESPONSE_ID_KEY: ""},
+        {TERMINAL_RESPONSE_ID_KEY: 12},
+        {TERMINAL_RESPONSE_ID_KEY: False},
+    ],
+)
+async def test_terminal_declaration_survives_verifier_omitting_metadata(verifier_fields: dict[str, object]) -> None:
+    environment, client = _environment_server(token_capture=True)
+    agent_response = _agent_response().model_copy(update={"metadata": {TERMINAL_RESPONSE_ID_KEY: "root-terminal"}})
+    client.responses[2] = _Response(agent_response.model_dump(mode="json"))
+    verification = orjson.loads(client.responses[4].body)
+    verification.update(verifier_fields)
+    client.responses[4] = _Response(verification)
+
+    reply = await environment.run_request(_request())
+
+    assert reply.failure is None
+    result = reply.result.model_dump(mode="json")
+    assert result[TERMINAL_RESPONSE_ID_KEY] == "root-terminal"
+    assert result["response"]["metadata"] is None
+    assert result["reward"] == 1.0
+    assert result["benchmark_field"] == "preserved"
+    restored = SingleAgentTurnResponse.model_validate_json(reply.model_dump_json())
+    assert restored.result.model_dump()[TERMINAL_RESPONSE_ID_KEY] == "root-terminal"
+    assert client.calls[4][2]["json"]["response"]["metadata"][TERMINAL_RESPONSE_ID_KEY] == "root-terminal"
+    assert [path for _, path, _ in client.calls][-1] == "/close_session"
+
+
+@pytest.mark.parametrize("metadata", [None, {}, {TERMINAL_RESPONSE_ID_KEY: ""}, {"other": "value"}])
+async def test_missing_terminal_declaration_does_not_infer_response_id(metadata: dict[str, str] | None) -> None:
+    environment, client = _environment_server(token_capture=True)
+    agent_response = _agent_response().model_copy(update={"metadata": metadata})
+    client.responses[2] = _Response(agent_response.model_dump(mode="json"))
+
+    reply = await environment.run_request(_request())
+
+    assert reply.failure is None
+    assert TERMINAL_RESPONSE_ID_KEY not in reply.result.model_dump(mode="json")
+    assert reply.result.response.id == "response"
+
+
+@pytest.mark.parametrize("invalid_terminal", [12, False, ["root-terminal"]])
+async def test_non_string_agent_terminal_metadata_is_rejected(invalid_terminal: object) -> None:
+    environment, client = _environment_server(token_capture=True)
+    payload = _agent_response().model_dump(mode="json")
+    payload["metadata"] = {TERMINAL_RESPONSE_ID_KEY: invalid_terminal}
+    client.responses[2] = _Response(payload)
+    # Failed activation closes the agent and resources without calling the verifier.
+    client.responses.pop(4)
+
+    reply = await environment.run_request(_request())
+
+    assert reply.result is None
+    assert reply.failure.stage == "agent"
+    assert "/verify" not in [path for _, path, _ in client.calls]
+    assert client.calls[-1][1] == "/close_session"
+
+
+@pytest.mark.parametrize("explicit_terminal", ["root-terminal", "verifier-terminal"])
+async def test_explicit_verifier_terminal_declaration_takes_precedence(explicit_terminal: str) -> None:
+    environment, client = _environment_server(token_capture=True)
+    agent_response = _agent_response().model_copy(update={"metadata": {TERMINAL_RESPONSE_ID_KEY: "root-terminal"}})
+    client.responses[2] = _Response(agent_response.model_dump(mode="json"))
+    verification = orjson.loads(client.responses[4].body)
+    verification[TERMINAL_RESPONSE_ID_KEY] = explicit_terminal
+    client.responses[4] = _Response(verification)
+
+    reply = await environment.run_request(_request())
+
+    assert reply.failure is None
+    assert reply.result.model_dump(mode="json")[TERMINAL_RESPONSE_ID_KEY] == explicit_terminal
 
 
 async def test_single_agent_turn_translates_resources_mcp_metadata_to_canonical_tool_access() -> None:

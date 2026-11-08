@@ -51,6 +51,7 @@ from nemo_gym.core import (
     model_sampling_path_segment,
     rebuild_failure,
 )
+from nemo_gym.models.token_capture import TERMINAL_RESPONSE_ID_KEY
 from nemo_gym.server_runtime import (
     CHECKPOINT_CLOSE_FOLLOWS_HEADER,
     BaseEnvironmentServer,
@@ -115,6 +116,10 @@ class SingleAgentTurnEnvironmentServerConfig(BaseEnvironmentServerConfig):
     # A pairing moved off the legacy_agent relay then keeps skipping as its agent's /run did.
     skip_verification: bool | None = None
     skip_verification_reward: float | None = None
+    mask_incomplete_for_training: bool = Field(
+        default=False,
+        description="Exclude unfinished harness executions and incomplete verification from training loss.",
+    )
 
 
 class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequest, SingleAgentTurnResponse]):
@@ -561,7 +566,29 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 await raise_boundary_failure(verify_http_response, content=await verify_http_response.read())
                 raise
             await raise_boundary_failure(verify_http_response, content=await verify_http_response.read())
-            return SingleAgentTurnResult.model_validate(payload)
+            result = SingleAgentTurnResult.model_validate(payload)
+            finished = (agent_response.metadata or {}).get("agent_execution_finished")
+            if finished in ("true", "false"):
+                # Preserve explicit process evidence even when verification omits
+                # response metadata. Never infer it from model completion status.
+                result = result.model_copy(update={"agent_execution_finished": finished == "true"})
+            fields = result.model_extra or {}
+            if self.config.mask_incomplete_for_training and (
+                fields.get("evaluation_completed") is False or fields.get("agent_execution_finished") is False
+            ):
+                # Training loss validity is separate from the verifier's quality
+                # mask. Keep its verdict/reward and any existing instance fields.
+                instance_config = dict(fields.get("instance_config") or {})
+                instance_config["mask_sample"] = True
+                result = result.model_copy(update={"instance_config": instance_config})
+            explicit_terminal = (result.model_extra or {}).get(TERMINAL_RESPONSE_ID_KEY)
+            if not (isinstance(explicit_terminal, str) and explicit_terminal):
+                terminal = (agent_response.metadata or {}).get(TERMINAL_RESPONSE_ID_KEY)
+                if isinstance(terminal, str) and terminal:
+                    # Receipt consumers read the result-level declaration; a verifier may omit
+                    # response metadata. Keep an explicit verifier declaration authoritative.
+                    result = result.model_copy(update={TERMINAL_RESPONSE_ID_KEY: terminal})
+            return result
         except Exception as error:
             raise dependency_failure(
                 error,

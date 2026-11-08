@@ -729,6 +729,7 @@ class VLLMModel(SimpleResponsesAPIModel):
     )
     _external_capture_handler: ExternalCaptureHandler | None = PrivateAttr(default=None)
     _warned_request_chat_template_kwargs_dropped: bool = PrivateAttr(default=False)
+    _warned_sampling_override_conflict: bool = PrivateAttr(default=False)
     _tar_audio_reader: TarAudioReader = PrivateAttr(default_factory=TarAudioReader)
     _generation_cut_control_urls: Dict[str, str] = PrivateAttr(default_factory=dict)
 
@@ -1108,6 +1109,35 @@ class VLLMModel(SimpleResponsesAPIModel):
             response.metadata = {**(response.metadata or {}), "nemo_gym_context_window_exceeded": "true"}
         return response
 
+    def _warn_sampling_override_conflicts(self, request_values: Dict[str, Any]) -> None:
+        """Compare request fields before defaults; warn once per worker, then log at debug."""
+        overrides = self.config.sampling_overrides or {}
+        conflicts = {}
+        for name, value in overrides.items():
+            request_name = name
+            if name in ("max_tokens", "max_completion_tokens"):
+                # Chat uses max_completion_tokens when both spellings are present.
+                if name == "max_tokens" and overrides.get("max_completion_tokens") is not None:
+                    continue
+                request_name = (
+                    "max_completion_tokens"
+                    if request_values.get("max_completion_tokens") is not None
+                    else "max_tokens"
+                )
+            requested = request_values.get(request_name)
+            if requested is not None and requested != value:
+                conflicts[name] = {"requested": requested, "effective": value}
+        if conflicts:
+            level = logging.DEBUG if self._warned_sampling_override_conflict else logging.WARNING
+            self._warned_sampling_override_conflict = True
+            LOG.log(
+                level,
+                "Model Server `%s`: sampling_overrides replaces request sampling values: %s. "
+                "Logged at WARNING once per worker; subsequent conflicts at DEBUG.",
+                self.config.name,
+                conflicts,
+            )
+
     def _apply_sampling_overrides(
         self, body_dict: Dict[str, Any], *, api: Literal["chat", "completions", "responses"] = "chat"
     ) -> Dict[str, Any]:
@@ -1166,6 +1196,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             raise ValueError("metadata.audio_ref requires is_responses_native=false and the chat-completions backend.")
 
         body_dict = body.model_dump(exclude_unset=True)
+        self._warn_sampling_override_conflicts(body_dict)
         body_dict["model"] = self.config.model
         if self.config.chat_template_kwargs:
             body_dict["chat_template_kwargs"] = deepcopy(self.config.chat_template_kwargs)
@@ -1304,6 +1335,7 @@ class VLLMModel(SimpleResponsesAPIModel):
             The (possibly mutated) ``body_dict`` that will be forwarded to
             ``client.create_chat_completion``.
         """
+        self._warn_sampling_override_conflicts(body_dict)
         self._strip_hosted_only_tool_fields(body_dict)
 
         if self.config.replace_developer_role_with_system:
@@ -2322,6 +2354,8 @@ class VLLMModel(SimpleResponsesAPIModel):
         # ``max_completion_tokens`` is the chat-API alias; map onto ``max_tokens``.
         if "max_tokens" not in out and "max_completion_tokens" in chat_body_dict:
             out["max_tokens"] = chat_body_dict["max_completion_tokens"]
+
+        self._warn_sampling_override_conflicts(out)
 
         # /v1/completions ``logprobs`` is an int (top-N), not a bool. We mainly
         # need ``logprobs=0`` (just the sampled token's logprob) when the

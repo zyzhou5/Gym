@@ -83,7 +83,7 @@ from responses_api_agents.claude_code_agent.observability import (
     extract_claude_code_observations,
 )
 from responses_api_agents.claude_code_agent.parsing import _extract_instruction, _invocation_outcome, parse_stream_json
-from responses_api_agents.claude_code_agent.runtime import install_sandbox_runtime
+from responses_api_agents.claude_code_agent.runtime import install_sandbox_runtime, runtime_setup_admission
 from responses_api_agents.claude_code_agent.sandbox import (
     ClaudeCodeSandboxSession,
     parse_artifact_observations,
@@ -123,6 +123,9 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     model: str = "claude-sonnet-4-6"
     anthropic_api_key: str = ""  # pragma: allowlist secret
     anthropic_base_url: Optional[str] = None
+    auto_compaction: bool = True
+    context_window: int | None = Field(default=None, gt=0)
+    max_output_tokens: int | None = Field(default=None, gt=0, le=2**53 - 1)
     max_turns: Optional[int] = 30  # None -> unlimited turns
     timeout: int = 300
     system_prompt: Optional[str] = None
@@ -153,6 +156,7 @@ class ClaudeCodeAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_local_executable_path: str | None = None
     sandbox_executable_sha256: str | None = Field(default=None, pattern=r"^[a-fA-F0-9]{64}$")
     sandbox_install_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
+    sandbox_install_queue_timeout_seconds: float = Field(default=3600, gt=0, allow_inf_nan=False)
     session_close_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
 
 
@@ -241,7 +245,21 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             user_settings = json.loads(Path(self.config.settings).expanduser().read_text())
             user_env = user_settings.get("env") or {}
             settings = {**settings, **user_settings, "env": {**settings["env"], **user_env}}
+        # Keep explicit training controls authoritative over a user settings file.
+        settings["env"].update(self._context_env())
         return settings
+
+    def _context_env(self) -> dict[str, str]:
+        """Controls inherited by the CLI and its delegated model calls."""
+        env = {}
+        if not self.config.auto_compaction:
+            # DISABLE_COMPACT also disables reactive overflow compaction in the pinned CLI.
+            env.update(DISABLE_COMPACT="1", DISABLE_AUTO_COMPACT="1")
+            if self.config.context_window is not None:
+                env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(self.config.context_window)
+        if self.config.max_output_tokens is not None:
+            env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(self.config.max_output_tokens)
+        return env
 
     def _setup_config_dir(self, skills_path: Optional[str] = None) -> Path:
         """Create a per-run CLAUDE_CONFIG_DIR and stage settings (and optionally skills) into it.
@@ -299,6 +317,9 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             )
         if self.config.bare and not skills_active:
             cmd.append("--bare")
+        if not self.config.auto_compaction:
+            # A preset name suppresses the CLI's background session-title model call.
+            cmd += ["--name", "Gym rollout"]
         cmd += ["--model", model]
         effective_mcp_config = mcp_config if mcp_config is not None else self.config.mcp_config
         if effective_mcp_config:
@@ -355,6 +376,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
                 "IS_SANDBOX": "1",
                 "CLAUDE_CONFIG_DIR": str(claude_config_dir),
                 **_HEADLESS_RUN_ENV,
+                **self._context_env(),
             }
             if base_url:
                 env["ANTHROPIC_BASE_URL"] = base_url
@@ -655,30 +677,31 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             ),
         )
         try:
-            async with asyncio.timeout(self.config.sandbox_install_timeout_seconds):
-                if owns_sandbox:
-                    await sandbox.start(spec)
-                    result = await sandbox.exec(f"mkdir -p -- {quote(workdir)}", cwd="/", timeout_s=30)
+            async with runtime_setup_admission(timeout=self.config.sandbox_install_queue_timeout_seconds):
+                async with asyncio.timeout(self.config.sandbox_install_timeout_seconds):
+                    if owns_sandbox:
+                        await sandbox.start(spec)
+                        result = await sandbox.exec(f"mkdir -p -- {quote(workdir)}", cwd="/", timeout_s=30)
+                        self._check_sandbox_setup(result)
+                    result = await sandbox.exec(
+                        _BASH_BOOTSTRAP + f"test -d {quote(workdir)} && umask 077 && mkdir -p {quote(directory)}/config",
+                        cwd="/",
+                        timeout_s=self.config.sandbox_install_timeout_seconds,
+                    )
                     self._check_sandbox_setup(result)
-                result = await sandbox.exec(
-                    _BASH_BOOTSTRAP + f"test -d {quote(workdir)} && umask 077 && mkdir -p {quote(directory)}/config",
-                    cwd="/",
-                    timeout_s=self.config.sandbox_install_timeout_seconds,
-                )
-                self._check_sandbox_setup(result)
-                await sandbox.upload(HARNESS_RUNNER_SCRIPT, f"{directory}/{HARNESS_RUNNER_FILE}")
-                installer = "install_claude_runtime.sh"
-                await sandbox.upload(Path(__file__).with_name(installer), f"{directory}/{installer}")
-                await install_sandbox_runtime(
-                    sandbox,
-                    version=version,
-                    directory=directory,
-                    runtime=runtime,
-                    timeout=self.config.sandbox_install_timeout_seconds,
-                    source=self.config.sandbox_executable_path,
-                    local_source=self.config.sandbox_local_executable_path,
-                    expected=self.config.sandbox_executable_sha256,
-                )
+                    await sandbox.upload(HARNESS_RUNNER_SCRIPT, f"{directory}/{HARNESS_RUNNER_FILE}")
+                    installer = "install_claude_runtime.sh"
+                    await sandbox.upload(Path(__file__).with_name(installer), f"{directory}/{installer}")
+                    await install_sandbox_runtime(
+                        sandbox,
+                        version=version,
+                        directory=directory,
+                        runtime=runtime,
+                        timeout=self.config.sandbox_install_timeout_seconds,
+                        source=self.config.sandbox_executable_path,
+                        local_source=self.config.sandbox_local_executable_path,
+                        expected=self.config.sandbox_executable_sha256,
+                    )
             return state
         except BaseException as error:
             try:
@@ -757,6 +780,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
             "CLAUDE_CODE_SUBAGENT_MODEL": model,
+            **self._context_env(),
             "DISABLE_AUTOUPDATER": "1",
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
             **_HEADLESS_RUN_ENV,
@@ -766,6 +790,10 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
                 ANTHROPIC_BASE_URL=base_url,
                 ANTHROPIC_AUTH_TOKEN="gym" if self.config.model_server else self.config.anthropic_api_key or "local",
             )
+        settings = self._build_settings()
+        for name, value in settings["env"].items():
+            if name in env and value != env[name]:
+                raise HTTPException(422, f"Claude settings env conflicts with the session's {name}")
         artifacts = None
         failure = None
         try:
@@ -782,7 +810,7 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
                         "command": command,
                         "cwd": state.session.workdir,
                         "env": env,
-                        "settings": self._build_settings(),
+                        "settings": settings,
                         "mcp_config": self._get_static_mcp_config() if mcp_config else None,
                         "skills_path": skills_path,
                     },
@@ -847,7 +875,12 @@ class ClaudeCodeAgent(SimpleResponsesAPIAgent):
             )
         if failure is not None:
             raise failure
-        return self._response_from_output(body, items, model, run_metadata, status=status)
+        response = self._response_from_output(body, items, model, run_metadata, status=status)
+        response.metadata = {
+            **(response.metadata or {}),
+            "agent_execution_finished": str(state.session.execution_finished).lower(),
+        }
+        return response
 
     async def responses(
         self,

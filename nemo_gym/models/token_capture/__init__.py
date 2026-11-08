@@ -64,7 +64,11 @@ if TYPE_CHECKING:
         trajectories_for_rollout,
         trajectories_from_source,
     )
-    from nemo_gym.models.token_capture.delivery import finalize_rollout_token_capture, retire_rollout_token_capture
+    from nemo_gym.models.token_capture.delivery import (
+        TERMINAL_RESPONSE_ID_KEY,
+        finalize_rollout_token_capture,
+        retire_rollout_token_capture,
+    )
     from nemo_gym.models.token_capture.fingerprint import assistant_fingerprint
     from nemo_gym.models.token_capture.lineage import (
         FileLineageStore,
@@ -165,6 +169,7 @@ _PUBLIC_API = {
     "RolloutLineage": "lineage",
     "RolloutRemovalPayload": "protocols",
     "RolloutRetiredError": "protocols",
+    "TERMINAL_RESPONSE_ID_KEY": "delivery",
     "TOKEN_ENTRY_MIN_SCHEMA_VERSION": "records",
     "TOKEN_ENTRY_RECORD_SCHEMA_VERSION": "records",
     "TOKEN_FIELDS": "records",

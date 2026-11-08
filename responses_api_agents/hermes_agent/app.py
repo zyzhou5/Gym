@@ -293,7 +293,7 @@ class HermesAgentConfig(BaseResponsesAPIAgentConfig):
     model: Optional[str] = None
     concurrency: int = 32
     max_turns: int = 90
-    max_tokens: Optional[int] = None
+    max_tokens: Optional[int] = Field(default=None, gt=0)
     enabled_toolsets: Optional[list[str]] = None
     disabled_toolsets: Optional[list[str]] = None
     temperature: float | None = None
@@ -709,6 +709,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
             "agent_session_id": agent_session_id,
             "chat_template_kwargs_enabled": self.config.chat_template_kwargs_enabled,
             "config_yaml": self._build_config(mcp_accesses),
+            "preserve_training_history": not self.config.compression_enabled,
             "disabled_toolsets": self.config.disabled_toolsets,
             "enabled_toolsets": enabled_toolsets,
             "mcp_servers": [access.name for access in mcp_accesses],
@@ -782,6 +783,9 @@ class HermesAgent(SimpleResponsesAPIAgent):
             **(response.metadata or {}),
             "harness_execution": "sandbox",
             AGENT_TIMEOUT_METADATA_KEY: str(timeout),
+            "agent_execution_finished": str(
+                state.session.execution_finished and not timed_out and result.get("stop_reason") != "wall_time"
+            ).lower(),
         }
         if timed_out or response.metadata.get("stop_reason") == "wall_time":
             response.metadata["hermes_error_type"] = "TimeoutError"
@@ -803,13 +807,7 @@ class HermesAgent(SimpleResponsesAPIAgent):
         """Validate once at the HTTP boundary, identically for host and sandbox execution."""
         if body.model is not None and body.model != self._model_name():
             raise HTTPException(422, "Hermes request model must match the configured model")
-        if body.max_output_tokens is not None:
-            raise HTTPException(
-                422,
-                "Hermes does not support the total max_output_tokens budget; "
-                "configure max_tokens for a per-model-call limit instead",
-            )
-        supported = {"input", "instructions", "temperature", "model"}
+        supported = {"input", "instructions", "temperature", "top_p", "max_output_tokens", "model"}
         # Fail closed for new schema fields instead of silently accepting unimplemented controls.
         for name, field in type(body).model_fields.items():
             if name in supported:
@@ -855,7 +853,10 @@ class HermesAgent(SimpleResponsesAPIAgent):
             )
             or None,
             "temperature": body.temperature if body.temperature is not None else self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            "top_p": body.top_p,
+            "max_tokens": min(cap for cap in (self.config.max_tokens, body.max_output_tokens) if cap is not None)
+            if self.config.max_tokens is not None or body.max_output_tokens is not None
+            else None,
         }
 
     def _response_from_result(
@@ -997,7 +998,14 @@ class HermesAgent(SimpleResponsesAPIAgent):
             )
 
         agent._build_api_kwargs = _patched_build_api_kwargs
-        install_summary_compat(agent, preserve_reasoning_history=self.config.chat_template_kwargs_enabled)
+        install_summary_compat(
+            agent,
+            preserve_reasoning_history=self.config.chat_template_kwargs_enabled,
+            preserve_training_history=not self.config.compression_enabled,
+            sampling_overrides={
+                key: params[key] for key in ("temperature", "top_p", "max_tokens") if params[key] is not None
+            },
+        )
         observer = None
         if observation_collector is not None:
             try:

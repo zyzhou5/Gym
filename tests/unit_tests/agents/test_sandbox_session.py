@@ -1114,3 +1114,22 @@ def test_shell_assignments_round_trip_through_bash(tmp_path):
 def test_shell_assignments_reject_names_bash_cannot_assign(values):
     with pytest.raises(ValueError, match="Invalid"):
         shell_assignments(values)
+
+
+@pytest.mark.parametrize(
+    ("receipt", "expected"),
+    [
+        (None, False),
+        (RECEIPT, True),
+        ({**RECEIPT, "return_code": 1}, False),
+        ({**RECEIPT, "return_code": None}, False),
+        ({**RECEIPT, "timed_out": True}, False),
+        ({**RECEIPT, "error": "exec failed"}, False),
+    ],
+)
+def test_execution_finished_requires_successful_process_exit(receipt, expected):
+    session = SandboxSession(
+        sandbox=AsyncMock(spec=AsyncSandbox), session_dir="/session", workdir="/app", harness="test"
+    )
+    session.cleanup = receipt
+    assert session.execution_finished is expected

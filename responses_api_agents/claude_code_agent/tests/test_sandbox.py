@@ -22,6 +22,10 @@ from responses_api_agents.claude_code_agent import app
 from responses_api_agents.claude_code_agent import sandbox as adapter
 
 
+class _SessionStub(SimpleNamespace):
+    execution_finished = app.SandboxSession.execution_finished
+
+
 def seed(*, borrowed=True, workdir="/app"):
     return AgentSeedSessionRequest(
         agent_session_id="session",
@@ -310,7 +314,7 @@ async def test_native_events_outcome_and_shared_command_options(monkeypatch, tim
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_dir="/tmp/session",
             workdir="/app",
             cleanup={"timed_out": timed_out, "return_code": code, "cleanup_confirmed": True},
@@ -344,7 +348,7 @@ async def test_artifact_capture_reads_separate_stdout_and_process_info(monkeypat
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_dir="/tmp/session",
             sandbox=SimpleNamespace(exec=AsyncMock(return_value=result(code=1))),
             read_output_log=AsyncMock(return_value='{"type":"result","subtype":"error_fake"}'),
@@ -368,7 +372,7 @@ async def test_artifact_capture_reads_separate_stdout_and_process_info(monkeypat
 @pytest.mark.asyncio
 async def test_close_returns_gap_without_activation_and_honors_cleanup_error():
     instance = agent()
-    session = SimpleNamespace(
+    session = _SessionStub(
         close=AsyncMock(side_effect=RuntimeError("unconfirmed")), artifacts=None, cleanup_confirmed=True
     )
     state = adapter.ClaudeCodeSandboxSession(request=seed(), runtime="/runtime", session=session)
@@ -394,7 +398,7 @@ async def test_close_bounds_a_stubborn_activation():
     task = asyncio.create_task(activation())
     await started.wait()
     state = adapter.ClaudeCodeSandboxSession(
-        request=seed(), runtime="/runtime", session=SimpleNamespace(close=AsyncMock(), artifacts=None), task=task
+        request=seed(), runtime="/runtime", session=_SessionStub(close=AsyncMock(), artifacts=None), task=task
     )
     try:
         with pytest.raises(TimeoutError):
@@ -438,7 +442,7 @@ async def test_close_joins_captured_observations_during_parsing(monkeypatch, par
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_dir="/tmp/session",
             workdir="/app",
             artifacts=artifacts,
@@ -486,7 +490,7 @@ async def test_sandbox_honors_task_timeout_and_server_ceiling(monkeypatch, metad
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(session_dir="/tmp/session", workdir="/app", cleanup=None),
+        session=_SessionStub(session_dir="/tmp/session", workdir="/app", cleanup=None),
     )
     execute = AsyncMock(return_value=adapter.ClaudeCodeArtifacts(""))
     monkeypatch.setattr(adapter.ClaudeCodeSandboxSession, "execute", execute)
@@ -512,9 +516,7 @@ def request(session_id="session", rollout="rollout"):
 @pytest.mark.asyncio
 async def test_retry_shares_execution_and_rejects_changed_body(monkeypatch):
     instance = agent()
-    state = adapter.ClaudeCodeSandboxSession(
-        request=seed(), runtime="/runtime", session=SimpleNamespace(closing=False)
-    )
+    state = adapter.ClaudeCodeSandboxSession(request=seed(), runtime="/runtime", session=_SessionStub(closing=False))
     async with instance._locked_agent_session("session") as record:
         record.state = state
     response = MagicMock()
@@ -572,7 +574,7 @@ async def test_empty_sandbox_output_uses_local_padding(monkeypatch):
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_dir="/tmp/session", workdir="/app", artifacts=None, cleanup={"timed_out": False, "return_code": 0}
         ),
     )
@@ -594,7 +596,7 @@ async def test_sandbox_only_receives_direct_credentials_without_gym_model_server
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(session_dir="/tmp/session", workdir="/app", cleanup=None),
+        session=_SessionStub(session_dir="/tmp/session", workdir="/app", cleanup=None),
     )
     execute = AsyncMock(return_value=adapter.ClaudeCodeArtifacts(""))
     monkeypatch.setattr(adapter.ClaudeCodeSandboxSession, "execute", execute)
@@ -617,7 +619,7 @@ async def test_cancelled_activation_reports_sandbox_outcome(monkeypatch, timed_o
     state = adapter.ClaudeCodeSandboxSession(
         request=seed(),
         runtime="/runtime",
-        session=SimpleNamespace(
+        session=_SessionStub(
             session_dir="/tmp/session",
             workdir="/app",
             artifacts=adapter.ClaudeCodeArtifacts(""),
@@ -647,7 +649,7 @@ async def test_skills_are_staged_before_launch_and_disable_bare(monkeypatch, tmp
 
     remote = SimpleNamespace(upload=upload)
     state = adapter.ClaudeCodeSandboxSession(
-        request=seed(), runtime="/runtime", session=SimpleNamespace(session_dir="/tmp/session", sandbox=remote)
+        request=seed(), runtime="/runtime", session=_SessionStub(session_dir="/tmp/session", sandbox=remote)
     )
     payload = {
         "command": ["/runtime/claude"],
@@ -767,3 +769,59 @@ async def test_close_distinguishes_borrowed_release_from_confirmed_termination(c
     remote.disconnect.assert_awaited_once()
     assert close.cleanup_confirmed is confirmed
     assert close.model_dump(mode="json")["cleanup_confirmed"] is confirmed
+
+
+@pytest.mark.asyncio
+async def test_settings_cannot_redirect_sampled_model_calls(monkeypatch, tmp_path):
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://uncontrolled.example"}}))
+    instance = agent(model_server={"type": "responses_api_models", "name": "policy"}, settings=str(settings))
+    monkeypatch.setattr(app.ClaudeCodeAgent, "_resolve_call_base_url", lambda self, rollout: "http://model")
+    state = adapter.ClaudeCodeSandboxSession(
+        request=seed(), runtime="/runtime", session=_SessionStub(session_dir="/tmp/session", workdir="/app")
+    )
+    execute = AsyncMock()
+    monkeypatch.setattr(adapter.ClaudeCodeSandboxSession, "execute", execute)
+    with pytest.raises(HTTPException, match="conflicts with the session's ANTHROPIC_BASE_URL"):
+        await instance._sandbox_response(
+            state, NeMoGymResponseCreateParamsNonStreaming(input="Fix", temperature=0.3), prompt="Fix", system=None
+        )
+    execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize("skills_active", [False, True])
+@pytest.mark.parametrize("auto_compaction", [False, True])
+def test_training_command_presets_title_to_prevent_background_model_call(skills_active, auto_compaction):
+    instance = agent(auto_compaction=auto_compaction)
+    command = instance._build_command(
+        "model", "Task text must not become the session title", skills_active=skills_active
+    )
+    if auto_compaction:
+        assert "--name" not in command
+    else:
+        assert command[command.index("--name") + 1] == "Gym rollout"
+        assert command.index("--name") < command.index("--")
+
+
+@pytest.mark.asyncio
+async def test_seed_admits_whole_setup_before_starting_install_deadline(monkeypatch):
+    from responses_api_agents.claude_code_agent import runtime
+
+    monkeypatch.setattr(runtime, "_RUNTIME_SETUP_SLOTS", asyncio.Semaphore(1))
+    remote = SimpleNamespace(exec=AsyncMock(return_value=result()), upload=AsyncMock())
+    monkeypatch.setattr(app.AsyncSandbox, "connect", AsyncMock(return_value=remote))
+    monkeypatch.setattr(app, "create_provider", lambda config: object())
+    active = maximum = 0
+
+    async def install(*args, **kwargs):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.03)
+        active -= 1
+
+    monkeypatch.setattr(app, "install_sandbox_runtime", install)
+    instance = agent(sandbox_install_timeout_seconds=0.1, sandbox_install_queue_timeout_seconds=2)
+    states = await asyncio.gather(*(instance._seed_agent_session_state(seed()) for _ in range(8)))
+    assert len(states) == 8 and maximum == 1
+    assert runtime._RUNTIME_SETUP_SLOTS._value == 1
